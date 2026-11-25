@@ -1,61 +1,47 @@
-import { NextResponse, NextRequest } from "next/server";
+import { NextRequest } from "next/server";
 import { prisma } from "@/lib/db";
-import { auth } from "@clerk/nextjs/server";
-import { getCorsOrigin } from "@/lib/db";
+import { currentUserId, fail, json, options, serverError } from "@/lib/http";
+import { friendUserSelect } from "@/lib/friends";
 
+/**
+ * Pending friend requests for the signed-in user.
+ * ?direction=incoming (default) lists requests sent to you;
+ * ?direction=sent lists requests you sent that are still pending.
+ */
 export async function GET(req: NextRequest) {
-  const { userId } = await auth();
+  try {
+    const userId = await currentUserId();
+    if (!userId) return fail(req, "Unauthorized", 401);
 
-  if (!userId) {
-    return NextResponse.json(
-      { error: "Unauthorized" },
-      {
-        status: 401,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
+    const direction = new URL(req.url).searchParams.get("direction");
+    const sent = direction === "sent";
+
+    const requests = await prisma.friend.findMany({
+      where: sent
+        ? { userId, status: "PENDING" }
+        : { receiverId: userId, status: "PENDING" },
+      include: {
+        user: { select: friendUserSelect },
+        receiver: { select: friendUserSelect },
       },
+      orderBy: { createdAt: "desc" },
+    });
+
+    return json(
+      req,
+      requests.map((r) => ({
+        id: r.id,
+        status: r.status,
+        createdAt: r.createdAt,
+        isSender: sent,
+        otherUser: sent ? r.receiver : r.user,
+      })),
     );
+  } catch (error) {
+    return serverError(req, "GET /api/friend/request", error);
   }
-
-  const friends = await prisma.friend.findMany({
-    where: {
-      receiverId: userId,
-      status: "PENDING",
-    },
-
-    include: {
-      user: {
-        select: {
-          id: true,
-          userName: true,
-          profileImg: true,
-        },
-      },
-    },
-  });
-
-  const result = friends.map((friend) => ({
-    id: friend.id,
-    status: friend.status,
-    otherUser: friend.user,
-  }));
-
-  return NextResponse.json(result, {
-    headers: {
-      "Access-Control-Allow-Origin": getCorsOrigin(req),
-    },
-  });
 }
 
 export async function OPTIONS(req: NextRequest) {
-  return new Response("OK", {
-    status: 200,
-    headers: {
-      "Access-Control-Allow-Origin": getCorsOrigin(req),
-      "Access-Control-Allow-Methods": "GET, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
-      "Access-Control-Allow-Credentials": "true",
-    },
-  });
+  return options(req, "GET");
 }

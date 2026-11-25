@@ -1,207 +1,115 @@
-import { NextResponse, NextRequest } from "next/server";
-import { auth } from "@clerk/nextjs/server";
+import { NextRequest } from "next/server";
 import { prisma } from "@/lib/db";
-import { getCorsOrigin } from "@/lib/db";
+import {
+  currentUserId,
+  fail,
+  json,
+  options,
+  readJson,
+  serverError,
+  toId,
+} from "@/lib/http";
+import { cleanStringArray } from "@/lib/posts";
+import { groupInclude, isGroupAdmin, shapeGroup } from "@/lib/groups";
 
-export async function GET(
-  req: NextRequest,
-  { params }: { params: Promise<{ id: string }> },
-) {
-  const { userId } = await auth();
+type Ctx = { params: Promise<{ id: string }> };
 
-  if (!userId) {
-    return NextResponse.json(
-      { error: "Unauthorized" },
-      {
-        status: 401,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
-      },
-    );
-  }
-
-  const { id } = await params;
-  const numId = Number(id);
-
-  const group = await prisma.group.findUnique({
-    where: { id: numId },
-    include: {
-      groupMembers: {
-        where: {
-          memberId: userId,
-        },
-        select: {
-          memberId: true,
-          role: true,
-        },
-      },
-      _count: {
-        select: {
-          groupMembers: true,
-        },
-      },
-    },
-  });
-
-  if (!group) {
-    return NextResponse.json(
-      { error: "Group not found" },
-      {
-        status: 404,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
-      },
-    );
-  }
-
-  const result = {
-    ...group,
-    populationCount: group._count.groupMembers,
-    isFollowed: group.groupMembers.length > 0,
-    isAdmin: group?.groupMembers[0]?.role === "admin",
-  };
-
-  return NextResponse.json(result, {
-    headers: {
-      "Access-Control-Allow-Origin": getCorsOrigin(req),
-    },
-  });
-}
-
-export async function PATCH(
-  req: NextRequest,
-  { params }: { params: Promise<{ id: string }> },
-) {
+export async function GET(req: NextRequest, { params }: Ctx) {
   try {
-    const { userId } = await auth();
+    const userId = await currentUserId();
+    if (!userId) return fail(req, "Unauthorized", 401);
 
-    if (!userId) {
-      return NextResponse.json(
-        { error: "Unauthorized" },
-        {
-          status: 401,
-          headers: {
-            "Access-Control-Allow-Origin": getCorsOrigin(req),
-          },
-        },
-      );
-    }
+    const id = toId((await params).id);
+    if (!id) return fail(req, "Invalid group id", 400);
 
-    const body = await req.json();
-    console.log("Body received:", body);
-    let { groupName, description, groupImg, bannerImg, groupThemes } = body;
-
-    if (!groupName && !description && !groupImg && !bannerImg && !groupThemes) {
-      console.error("No change to add");
-      return NextResponse.json({ error: "No change to add" }, { status: 400 });
-    }
-
-    const { id } = await params;
-    const numId = Number(id);
-
-    const group = await prisma.group.update({
-      where: { id: numId },
-      data: { groupName, description, groupImg, bannerImg, groupThemes },
+    const group = await prisma.group.findUnique({
+      where: { id },
+      include: groupInclude(userId),
     });
+    if (!group) return fail(req, "Group not found", 404);
 
-    if (!group) {
-      return NextResponse.json(
-        { error: "Group not found" },
-        {
-          status: 404,
-          headers: {
-            "Access-Control-Allow-Origin": getCorsOrigin(req),
-          },
-        },
-      );
-    }
-
-    return NextResponse.json(group, {
-      headers: {
-        "Access-Control-Allow-Origin": getCorsOrigin(req),
-      },
-    });
+    return json(req, shapeGroup(group));
   } catch (error) {
-    console.error("GROUP /api/group/[id] error:", error);
-    return NextResponse.json(
-      { error: (error as Error).message },
-      {
-        status: 500,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
-      },
-    );
+    return serverError(req, "GET /api/group/[id]", error);
   }
 }
 
-export async function DELETE(
-  req: NextRequest,
-  { params }: { params: Promise<{ id: string }> },
-) {
+/** Edits group details. Admins only. */
+export async function PATCH(req: NextRequest, { params }: Ctx) {
   try {
-    const { userId } = await auth();
+    const userId = await currentUserId();
+    if (!userId) return fail(req, "Unauthorized", 401);
 
-    if (!userId) {
-      return NextResponse.json(
-        { error: "Unauthorized" },
-        {
-          status: 401,
-          headers: {
-            "Access-Control-Allow-Origin": getCorsOrigin(req),
-          },
-        },
-      );
+    const id = toId((await params).id);
+    if (!id) return fail(req, "Invalid group id", 400);
+
+    const group = await prisma.group.findUnique({ where: { id } });
+    if (!group) return fail(req, "Group not found", 404);
+    if (!(await isGroupAdmin(userId, id))) {
+      return fail(req, "Only group admins can edit this group", 403);
     }
 
-    const { id } = await params;
-    const numId = Number(id);
+    const body = await readJson(req);
+    if (!body) return fail(req, "Invalid JSON body", 400);
 
-    const group = await prisma.group.delete({
-      where: { id: numId },
-    });
-
-    if (!group) {
-      return NextResponse.json(
-        { error: "Group not found" },
-        {
-          status: 404,
-          headers: {
-            "Access-Control-Allow-Origin": getCorsOrigin(req),
-          },
-        },
-      );
+    const data: {
+      groupName?: string;
+      description?: string;
+      groupImg?: string;
+      bannerImg?: string;
+      groupThemes?: string[];
+      allowAnonymity?: boolean;
+    } = {};
+    if (typeof body.groupName === "string") {
+      const name = body.groupName.trim();
+      if (!name) return fail(req, "Group name cannot be empty", 400);
+      if (name !== group.groupName) {
+        const taken = await prisma.group.findUnique({ where: { groupName: name } });
+        if (taken) return fail(req, "A group with that name already exists", 409);
+      }
+      data.groupName = name;
     }
+    if (typeof body.description === "string") data.description = body.description;
+    if (typeof body.groupImg === "string" && body.groupImg) data.groupImg = body.groupImg;
+    if (typeof body.bannerImg === "string" && body.bannerImg) data.bannerImg = body.bannerImg;
+    if (Array.isArray(body.groupThemes)) data.groupThemes = cleanStringArray(body.groupThemes);
+    if (typeof body.allowAnonymity === "boolean") data.allowAnonymity = body.allowAnonymity;
 
-    return NextResponse.json(group, {
-      headers: {
-        "Access-Control-Allow-Origin": getCorsOrigin(req),
-      },
+    if (Object.keys(data).length === 0) return fail(req, "No change to add", 400);
+
+    const updated = await prisma.group.update({
+      where: { id },
+      data,
+      include: groupInclude(userId),
     });
+    return json(req, shapeGroup(updated));
   } catch (error) {
-    console.error("GROUP /api/group/[id] error:", error);
-    return NextResponse.json(
-      { error: (error as Error).message },
-      {
-        status: 500,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
-      },
-    );
+    return serverError(req, "PATCH /api/group/[id]", error);
+  }
+}
+
+/** Deletes a group and its posts. Admins only. */
+export async function DELETE(req: NextRequest, { params }: Ctx) {
+  try {
+    const userId = await currentUserId();
+    if (!userId) return fail(req, "Unauthorized", 401);
+
+    const id = toId((await params).id);
+    if (!id) return fail(req, "Invalid group id", 400);
+
+    const group = await prisma.group.findUnique({ where: { id } });
+    if (!group) return fail(req, "Group not found", 404);
+    if (!(await isGroupAdmin(userId, id))) {
+      return fail(req, "Only group admins can delete this group", 403);
+    }
+
+    await prisma.group.delete({ where: { id } });
+    return json(req, { id, deleted: true });
+  } catch (error) {
+    return serverError(req, "DELETE /api/group/[id]", error);
   }
 }
 
 export async function OPTIONS(req: NextRequest) {
-  return new Response("OK", {
-    status: 200,
-    headers: {
-      "Access-Control-Allow-Origin": getCorsOrigin(req),
-      "Access-Control-Allow-Methods": "GET, POST, DELETE, PATCH, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
-      "Access-Control-Allow-Credentials": "true",
-    },
-  });
+  return options(req, "GET, PATCH, DELETE");
 }

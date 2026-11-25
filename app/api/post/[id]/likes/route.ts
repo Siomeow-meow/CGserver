@@ -1,86 +1,47 @@
-import { NextRequest, NextResponse } from "next/server";
-import { auth } from "@clerk/nextjs/server";
+import { NextRequest } from "next/server";
 import { prisma } from "@/lib/db";
-import { getCorsOrigin } from "@/lib/db";
+import { notify } from "@/lib/notify";
+import { currentUserId, fail, json, options, readJson, serverError, toId } from "@/lib/http";
 
-export async function POST(
-  req: NextRequest,
-  { params }: { params: Promise<{ id: string }> },
-) {
-  const { userId } = await auth();
-  const { id } = await params;
-  const postId = Number(id);
-  const body = await req.json();
-  console.log("Body received:", body);
-  const { type } = body;
+type Ctx = { params: Promise<{ id: string }> };
 
-  if (!userId) {
-    return NextResponse.json(
-      { error: "Unauthorized" },
-      {
-        status: 401,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
-      },
-    );
+/** Toggles the signed-in user's like on a post. */
+export async function POST(req: NextRequest, { params }: Ctx) {
+  try {
+    const userId = await currentUserId();
+    if (!userId) return fail(req, "Unauthorized", 401);
+
+    const postId = toId((await params).id);
+    if (!postId) return fail(req, "Invalid post id", 400);
+
+    const post = await prisma.post.findUnique({ where: { id: postId } });
+    if (!post) return fail(req, "Post not found", 404);
+
+    const body = await readJson(req);
+    const type = typeof body?.type === "string" ? body.type : "like";
+    const key = { postId_likerId: { postId, likerId: userId } };
+
+    const existing = await prisma.postLike.findUnique({ where: key });
+    if (existing) {
+      await prisma.postLike.delete({ where: key });
+    } else {
+      await prisma.postLike.create({ data: { postId, likerId: userId, type } });
+      await notify({
+        userId: post.authorId,
+        actorId: userId,
+        type: "post_like",
+        content: `liked your post "${post.title}"`,
+        link: `/post/${postId}`,
+      });
+    }
+    const likesCount = await prisma.postLike.count({ where: { postId } });
+
+    return json(req, { liked: !existing, likesCount });
+  } catch (error) {
+    return serverError(req, "POST /api/post/[id]/likes", error);
   }
-
-  const existing = await prisma.postLike.findUnique({
-    where: {
-      postId_likerId: {
-        postId,
-        likerId: userId,
-      },
-    },
-  });
-
-  if (existing) {
-    await prisma.postLike.delete({
-      where: {
-        postId_likerId: {
-          postId,
-          likerId: userId,
-        },
-      },
-    });
-
-    return NextResponse.json(
-      { liked: false },
-      {
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
-      },
-    );
-  }
-
-  await prisma.postLike.create({
-    data: {
-      postId,
-      likerId: userId,
-      type,
-    },
-  });
-
-  return NextResponse.json(
-    { liked: true },
-    {
-      headers: {
-        "Access-Control-Allow-Origin": getCorsOrigin(req),
-      },
-    },
-  );
 }
 
 export async function OPTIONS(req: NextRequest) {
-  return new Response("OK", {
-    status: 200,
-    headers: {
-      "Access-Control-Allow-Origin": getCorsOrigin(req),
-      "Access-Control-Allow-Methods": "POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
-      "Access-Control-Allow-Credentials": "true",
-    },
-  });
+  return options(req, "POST");
 }

@@ -1,210 +1,137 @@
-import { NextResponse, NextRequest } from "next/server";
-import { auth } from "@clerk/nextjs/server";
+import { NextRequest } from "next/server";
 import { prisma } from "@/lib/db";
-import { getCorsOrigin } from "@/lib/db";
+import {
+  currentUserId,
+  fail,
+  json,
+  options,
+  readJson,
+  serverError,
+  toId,
+} from "@/lib/http";
+import {
+  cleanStringArray,
+  postInclude,
+  POST_STATUSES,
+  shapePost,
+} from "@/lib/posts";
 
-export async function GET(
-  req: NextRequest,
-  { params }: { params: Promise<{ id: string }> },
-) {
-  const { userId } = await auth();
+type Ctx = { params: Promise<{ id: string }> };
 
-  if (!userId) {
-    return NextResponse.json(
-      { error: "Unauthorized" },
-      {
-        status: 401,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
-      },
-    );
+export async function GET(req: NextRequest, { params }: Ctx) {
+  try {
+    const userId = await currentUserId();
+    if (!userId) return fail(req, "Unauthorized", 401);
+
+    const id = toId((await params).id);
+    if (!id) return fail(req, "Invalid post id", 400);
+
+    const post = await prisma.post.findUnique({
+      where: { id },
+      include: postInclude(userId),
+    });
+    if (!post || (post.status === "draft" && post.authorId !== userId)) {
+      return fail(req, "Post not found", 404);
+    }
+
+    return json(req, shapePost(post, userId));
+  } catch (error) {
+    return serverError(req, "GET /api/post/[id]", error);
   }
-
-  const { id } = await params;
-  const numId = Number(id);
-
-  const [post, likesCount, likeRecord] = await Promise.all([
-    prisma.post.findUnique({
-      where: { id: numId },
-      include: { author: true },
-    }),
-
-    prisma.postLike.count({
-      where: { postId: numId },
-    }),
-
-    prisma.postLike.findUnique({
-      where: {
-        postId_likerId: {
-          postId: numId,
-          likerId: userId,
-        },
-      },
-    }),
-  ]);
-
-  if (!post) {
-    return NextResponse.json(
-      { error: "Post not found" },
-      {
-        status: 404,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
-      },
-    );
-  }
-
-  return NextResponse.json({
-    ...post,
-    likesCount,
-    isLiked: !!likeRecord,
-    headers: {
-      "Access-Control-Allow-Origin": getCorsOrigin(req),
-    },
-  });
 }
 
-export async function PATCH(
-  req: NextRequest,
-  { params }: { params: Promise<{ id: string }> },
-) {
+export async function PATCH(req: NextRequest, { params }: Ctx) {
   try {
-    const { userId } = await auth();
+    const userId = await currentUserId();
+    if (!userId) return fail(req, "Unauthorized", 401);
 
-    if (!userId) {
-      return NextResponse.json(
-        { error: "Unauthorized" },
-        {
-          status: 401,
-          headers: {
-            "Access-Control-Allow-Origin": getCorsOrigin(req),
-          },
-        },
-      );
+    const id = toId((await params).id);
+    if (!id) return fail(req, "Invalid post id", 400);
+
+    const existing = await prisma.post.findUnique({
+      where: { id },
+      include: { group: { select: { allowAnonymity: true } } },
+    });
+    if (!existing) return fail(req, "Post not found", 404);
+    if (existing.authorId !== userId) {
+      return fail(req, "You can only edit your own posts", 403);
     }
 
-    const body = await req.json();
-    console.log("Body received:", body);
-    let { title, content, tags, images, status } = body;
+    const body = await readJson(req);
+    if (!body) return fail(req, "Invalid JSON body", 400);
 
-    if (!title && !content && !tags && !images && !status) {
-      console.error("No change to add");
-      return NextResponse.json(
-        { error: "No change to add" },
-        {
-          status: 400,
-          headers: {
-            "Access-Control-Allow-Origin": getCorsOrigin(req),
-          },
-        },
-      );
+    const data: {
+      title?: string;
+      content?: string;
+      tags?: string[];
+      images?: string[];
+      status?: string;
+      isAnonymous?: boolean;
+    } = {};
+    if (typeof body.title === "string") {
+      if (!body.title.trim()) return fail(req, "Title cannot be empty", 400);
+      data.title = body.title.trim();
+    }
+    if (typeof body.content === "string") data.content = body.content;
+    if (Array.isArray(body.tags)) data.tags = cleanStringArray(body.tags);
+    if (Array.isArray(body.images)) data.images = cleanStringArray(body.images, 10);
+    if (typeof body.status === "string") {
+      if (!POST_STATUSES.includes(body.status)) {
+        return fail(req, "Invalid status", 400);
+      }
+      data.status = body.status;
+    }
+    if (typeof body.isAnonymous === "boolean") {
+      data.isAnonymous = !!existing.group?.allowAnonymity && body.isAnonymous;
     }
 
-    const { id } = await params;
-    const numId = Number(id);
+    if (Object.keys(data).length === 0) return fail(req, "No change to add", 400);
+
+    const content = data.content ?? existing.content ?? "";
+    const images = data.images ?? existing.images;
+    if (!content.trim() && images.length === 0) {
+      return fail(req, "A post needs content or an image", 400);
+    }
 
     const post = await prisma.post.update({
-      where: { id: numId },
-      data: { title, content, tags, images, status },
+      where: { id },
+      data,
+      include: postInclude(userId),
     });
 
-    if (!post) {
-      return NextResponse.json(
-        { error: "User not found" },
-        {
-          status: 404,
-          headers: {
-            "Access-Control-Allow-Origin": getCorsOrigin(req),
-          },
-        },
-      );
-    }
-
-    return NextResponse.json(post, {
-      headers: {
-        "Access-Control-Allow-Origin": getCorsOrigin(req),
-      },
-    });
+    return json(req, shapePost(post, userId));
   } catch (error) {
-    console.error("POST /api/post/[id] error:", error);
-    return NextResponse.json(
-      { error: (error as Error).message },
-      {
-        status: 500,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
-      },
-    );
+    return serverError(req, "PATCH /api/post/[id]", error);
   }
 }
 
-export async function DELETE(
-  req: NextRequest,
-  { params }: { params: Promise<{ id: string }> },
-) {
+export async function DELETE(req: NextRequest, { params }: Ctx) {
   try {
-    const { userId } = await auth();
+    const userId = await currentUserId();
+    if (!userId) return fail(req, "Unauthorized", 401);
 
-    if (!userId) {
-      return NextResponse.json(
-        { error: "Unauthorized" },
-        {
-          status: 401,
-          headers: {
-            "Access-Control-Allow-Origin": getCorsOrigin(req),
-          },
-        },
-      );
+    const id = toId((await params).id);
+    if (!id) return fail(req, "Invalid post id", 400);
+
+    const post = await prisma.post.findUnique({ where: { id } });
+    if (!post) return fail(req, "Post not found", 404);
+
+    let allowed = post.authorId === userId;
+    if (!allowed && post.groupId) {
+      const membership = await prisma.groupMember.findUnique({
+        where: { memberId_groupId: { memberId: userId, groupId: post.groupId } },
+      });
+      allowed = membership?.role === "admin";
     }
+    if (!allowed) return fail(req, "You can only delete your own posts", 403);
 
-    const { id } = await params;
-    const numId = Number(id);
-
-    const post = await prisma.post.delete({
-      where: { id: numId },
-    });
-
-    if (!post) {
-      return NextResponse.json(
-        { error: "Post not found" },
-        {
-          status: 404,
-          headers: {
-            "Access-Control-Allow-Origin": getCorsOrigin(req),
-          },
-        },
-      );
-    }
-    return NextResponse.json(post, {
-      headers: {
-        "Access-Control-Allow-Origin": getCorsOrigin(req),
-      },
-    });
+    await prisma.post.delete({ where: { id } });
+    return json(req, { id, deleted: true });
   } catch (error) {
-    console.error("DELETE /api/post/[id] error:", error);
-    return NextResponse.json(
-      { error: (error as Error).message },
-      {
-        status: 500,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
-      },
-    );
+    return serverError(req, "DELETE /api/post/[id]", error);
   }
 }
 
 export async function OPTIONS(req: NextRequest) {
-  return new Response("OK", {
-    status: 200,
-    headers: {
-      "Access-Control-Allow-Origin": getCorsOrigin(req),
-      "Access-Control-Allow-Methods": "GET, POST, DELETE, PATCH, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
-      "Access-Control-Allow-Credentials": "true",
-    },
-  });
+  return options(req, "GET, PATCH, DELETE");
 }

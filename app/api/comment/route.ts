@@ -1,163 +1,118 @@
-import { NextRequest, NextResponse } from "next/server";
-import { auth } from "@clerk/nextjs/server";
+import { NextRequest } from "next/server";
 import { prisma } from "@/lib/db";
-import { getCorsOrigin } from "@/lib/db";
-import { Comment } from "@prisma/client";
+import {
+  currentUserId,
+  fail,
+  json,
+  options,
+  readJson,
+  serverError,
+  toId,
+} from "@/lib/http";
+import { visibleTo } from "@/lib/posts";
+import { commentInclude, shapeComment } from "@/lib/comments";
+import { excerpt, mentionedUserIds, notify } from "@/lib/notify";
 
 export async function POST(req: NextRequest) {
   try {
-    const { userId } = await auth();
-    if (!userId) {
-      return NextResponse.json(
-        { error: "Unauthorized" },
-        {
-          status: 401,
-          headers: {
-            "Access-Control-Allow-Origin": getCorsOrigin(req),
-          },
-        },
-      );
+    const userId = await currentUserId();
+    if (!userId) return fail(req, "Unauthorized", 401);
+
+    const body = await readJson(req);
+    if (!body) return fail(req, "Invalid JSON body", 400);
+
+    const content = typeof body.content === "string" ? body.content.trim() : "";
+    const postId = toId(String(body.postId ?? ""));
+    const parentId = body.parentId == null ? null : toId(String(body.parentId));
+
+    if (!content || !postId) {
+      return fail(req, "Comment text and postId are required", 400);
     }
 
-    const body = await req.json();
-    console.log("Body received:", body);
-    let { content, postId, commenterId, parentId } = body;
+    const post = await prisma.post.findFirst({
+      where: { AND: [{ id: postId }, visibleTo(userId)] },
+    });
+    if (!post) return fail(req, "Post not found", 404);
 
-    if (!content || !postId || !userId) {
-      console.log("Missing fields!");
-      return NextResponse.json(
-        { error: "Missing required fields!" },
-        {
-          status: 400,
-          headers: {
-            "Access-Control-Allow-Origin": getCorsOrigin(req),
-          },
-        },
-      );
+    let parentCommenterId: string | null = null;
+    if (body.parentId != null) {
+      const parent = parentId
+        ? await prisma.comment.findUnique({ where: { id: parentId } })
+        : null;
+      if (!parent || parent.postId !== postId) {
+        return fail(req, "Reply target not found on this post", 400);
+      }
+      parentCommenterId = parent.commenterId;
     }
 
     const comment = await prisma.comment.create({
-      data: { commenterId, content, postId, parentId },
-      include: {
-        commenter: true,
-      },
+      data: { content, postId, parentId, commenterId: userId },
+      include: commentInclude(userId),
     });
 
-    return NextResponse.json(comment, {
-      headers: {
-        "Access-Control-Allow-Origin": getCorsOrigin(req),
-      },
-    });
+    const link = `/post/${postId}`;
+    const text = excerpt(content);
+    const notified = new Set<string>([userId]);
+    const items: Parameters<typeof notify>[0] = [];
+    if (parentCommenterId && !notified.has(parentCommenterId)) {
+      notified.add(parentCommenterId);
+      items.push({ userId: parentCommenterId, actorId: userId, type: "reply", content: text, link });
+    }
+    if (!notified.has(post.authorId)) {
+      notified.add(post.authorId);
+      items.push({ userId: post.authorId, actorId: userId, type: "comment", content: text, link });
+    }
+    for (const id of await mentionedUserIds(content)) {
+      if (notified.has(id)) continue;
+      notified.add(id);
+      items.push({ userId: id, actorId: userId, type: "mention", content: text, link });
+    }
+    await notify(items);
+
+    return json(req, { ...shapeComment(comment), replies: [] }, 201);
   } catch (error) {
-    console.error("POST /api/posts error:", error);
-    return NextResponse.json(
-      { error: (error as Error).message },
-      {
-        status: 500,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
-      },
-    );
+    return serverError(req, "POST /api/comment", error);
   }
 }
 
 export async function GET(req: NextRequest) {
-  const { userId } = await auth();
-  if (!userId) {
-    return NextResponse.json(
-      { error: "Unauthorized" },
-      {
-        status: 401,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
+  try {
+    const userId = await currentUserId();
+    if (!userId) return fail(req, "Unauthorized", 401);
+
+    const { searchParams } = new URL(req.url);
+    const postId = toId(searchParams.get("postId"));
+
+    const comments = await prisma.comment.findMany({
+      where: {
+        ...(postId ? { postId } : {}),
+        post: visibleTo(userId),
       },
-    );
+      include: commentInclude(userId),
+      orderBy: { createdAt: "asc" },
+    });
+
+    return json(req, buildTree(comments.map(shapeComment)));
+  } catch (error) {
+    return serverError(req, "GET /api/comment", error);
   }
-
-  const { searchParams } = new URL(req.url);
-  const postId = Number(searchParams.get("postId"));
-
-  const comments = await prisma.comment.findMany({
-    where: { postId: postId || undefined },
-    include: {
-      commenter: {
-        select: {
-          userName: true,
-          profileImg: true,
-        },
-      },
-    },
-  });
-
-  const commentsWithLikes = await Promise.all(
-    comments.map(async (comment) => {
-      const likesCount = await prisma.commentLike.count({
-        where: { commentId: comment.id },
-      });
-
-      const isLiked = await prisma.commentLike.findUnique({
-        where: {
-          commentId_likerId: {
-            commentId: comment.id,
-            likerId: userId,
-          },
-        },
-      });
-
-      return {
-        ...comment,
-        likesCount,
-        isLiked: !!isLiked,
-      };
-    }),
-  );
-
-  const tree = buildTree(commentsWithLikes);
-
-  console.log("GET /api/comments response:", tree);
-
-  return NextResponse.json(tree, {
-    headers: {
-      "Access-Control-Allow-Origin": getCorsOrigin(req),
-    },
-  });
 }
 
 export async function OPTIONS(req: NextRequest) {
-  return new Response("OK", {
-    status: 200,
-    headers: {
-      "Access-Control-Allow-Origin": getCorsOrigin(req),
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
-      "Access-Control-Allow-Credentials": "true",
-    },
-  });
+  return options(req, "GET, POST");
 }
 
-function buildTree(comments: Comment[]) {
-  const map = new Map();
+function buildTree<T extends { id: number; parentId: number | null }>(items: T[]) {
+  type Node = T & { replies: Node[] };
+  const map = new Map<number, Node>();
+  items.forEach((c) => map.set(c.id, { ...c, replies: [] }));
 
-  comments.forEach((c) => {
-    map.set(c.id, {
-      ...c,
-      replies: [],
-    });
+  const roots: Node[] = [];
+  items.forEach((c) => {
+    const node = map.get(c.id)!;
+    const parent = c.parentId ? map.get(c.parentId) : undefined;
+    if (parent) parent.replies.push(node);
+    else roots.push(node);
   });
-
-  const roots: Comment[] = [];
-
-  comments.forEach((c) => {
-    const node = map.get(c.id);
-
-    if (c.parentId) {
-      map.get(c.parentId)?.replies.push(node);
-    } else {
-      roots.push(node);
-    }
-  });
-
   return roots;
 }

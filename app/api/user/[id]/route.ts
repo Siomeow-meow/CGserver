@@ -1,104 +1,79 @@
-import { NextResponse, NextRequest } from "next/server";
+import { NextRequest } from "next/server";
 import { prisma } from "@/lib/db";
-import { getCorsOrigin } from "@/lib/db";
+import {
+  currentUserId,
+  fail,
+  json,
+  options,
+  publicUserSelect,
+  readJson,
+  serverError,
+} from "@/lib/http";
+import { USERNAME_PATTERN } from "@/lib/users";
 
-export async function GET(
-  req: NextRequest,
-  { params }: { params: Promise<{ id: string }> },
-) {
-  const { id } = await params;
+type Ctx = { params: Promise<{ id: string }> };
 
-  const user = await prisma.user.findUnique({
-    where: { id },
-  });
-
-  if (!user) {
-    return NextResponse.json(
-      { error: "User not found" },
-      {
-        status: 404,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
-      },
-    );
-  }
-
-  return NextResponse.json(user, {
-    headers: {
-      "Access-Control-Allow-Origin": getCorsOrigin(req),
-    },
-  });
-}
-
-export async function PATCH(
-  req: NextRequest,
-  { params }: { params: Promise<{ id: string }> },
-) {
+/** A user's profile. Your own profile also includes your email. */
+export async function GET(req: NextRequest, { params }: Ctx) {
   try {
-    const body = await req.json();
-    console.log("Body received:", body);
-    let { userName, fName, lName, bio, profileImg, bannerImg } = body;
-
-    if (!userName && !fName && !lName && !bio && !profileImg && !bannerImg) {
-      console.error("No change to add");
-      return NextResponse.json(
-        { error: "No change to add" },
-        {
-          status: 400,
-          headers: {
-            "Access-Control-Allow-Origin": getCorsOrigin(req),
-          },
-        },
-      );
-    }
+    const userId = await currentUserId();
+    if (!userId) return fail(req, "Unauthorized", 401);
 
     const { id } = await params;
-
-    const user = await prisma.user.update({
+    const user = await prisma.user.findUnique({
       where: { id },
-      data: { userName, fName, lName, bio, profileImg, bannerImg },
+      select: { ...publicUserSelect, email: id === userId },
     });
-
-    if (!user) {
-      return NextResponse.json(
-        { error: "User not found" },
-        {
-          status: 404,
-          headers: {
-            "Access-Control-Allow-Origin": getCorsOrigin(req),
-          },
-        },
-      );
-    }
-
-    return NextResponse.json(user, {
-      headers: {
-        "Access-Control-Allow-Origin": getCorsOrigin(req),
-      },
-    });
+    if (!user) return fail(req, "User not found", 404);
+    return json(req, user);
   } catch (error) {
-    console.error("POST /api/user error:", error);
-    return NextResponse.json(
-      { error: (error as Error).message },
-      {
-        status: 500,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
-      },
-    );
+    return serverError(req, "GET /api/user/[id]", error);
+  }
+}
+
+/** Edits your own profile. */
+export async function PATCH(req: NextRequest, { params }: Ctx) {
+  try {
+    const userId = await currentUserId();
+    if (!userId) return fail(req, "Unauthorized", 401);
+
+    const { id } = await params;
+    if (id !== userId) return fail(req, "You can only edit your own profile", 403);
+
+    const body = await readJson(req);
+    if (!body) return fail(req, "Invalid JSON body", 400);
+
+    const data: Record<string, string> = {};
+    for (const key of ["fName", "lName", "bio", "profileImg", "bannerImg"]) {
+      if (typeof body[key] === "string") data[key] = body[key] as string;
+    }
+    if (typeof body.userName === "string") {
+      const userName = body.userName.trim();
+      if (!USERNAME_PATTERN.test(userName)) {
+        return fail(
+          req,
+          "Username must be 2-30 characters: letters, numbers or _",
+          400,
+        );
+      }
+      const taken = await prisma.user.findUnique({ where: { userName } });
+      if (taken && taken.id !== userId) {
+        return fail(req, "That username is already taken", 409);
+      }
+      data.userName = userName;
+    }
+    if (Object.keys(data).length === 0) return fail(req, "No change to add", 400);
+
+    const existing = await prisma.user.findUnique({ where: { id } });
+    if (!existing) return fail(req, "User not found", 404);
+
+    const user = await prisma.user.update({ where: { id }, data });
+    return json(req, user);
+  } catch (error) {
+    return serverError(req, "PATCH /api/user/[id]", error);
   }
 }
 
 export async function OPTIONS(req: NextRequest) {
-  return new Response("OK", {
-    status: 200,
-    headers: {
-      "Access-Control-Allow-Origin": getCorsOrigin(req),
-      "Access-Control-Allow-Methods": "GET, POST, DELETE, PATCH, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
-      "Access-Control-Allow-Credentials": "true",
-    },
-  });
+  return options(req, "GET, PATCH");
 }

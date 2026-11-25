@@ -1,86 +1,39 @@
-import { NextRequest, NextResponse } from "next/server";
-import { auth } from "@clerk/nextjs/server";
+import { NextRequest } from "next/server";
 import { prisma } from "@/lib/db";
-import { getCorsOrigin } from "@/lib/db";
+import { currentUserId, fail, json, options, readJson, serverError, toId } from "@/lib/http";
 
-export async function POST(
-  req: NextRequest,
-  { params }: { params: Promise<{ id: string }> },
-) {
-  const { userId } = await auth();
-  const { id } = await params;
-  const commentId = Number(id);
-  const body = await req.json();
-  console.log("Body received:", body);
-  const { type } = body;
+type Ctx = { params: Promise<{ id: string }> };
 
-  if (!userId) {
-    return NextResponse.json(
-      { error: "Unauthorized" },
-      {
-        status: 401,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
-      },
-    );
+/** Toggles the signed-in user's like on a comment. */
+export async function POST(req: NextRequest, { params }: Ctx) {
+  try {
+    const userId = await currentUserId();
+    if (!userId) return fail(req, "Unauthorized", 401);
+
+    const commentId = toId((await params).id);
+    if (!commentId) return fail(req, "Invalid comment id", 400);
+
+    const comment = await prisma.comment.findUnique({ where: { id: commentId } });
+    if (!comment) return fail(req, "Comment not found", 404);
+
+    const body = await readJson(req);
+    const type = typeof body?.type === "string" ? body.type : "like";
+    const key = { commentId_likerId: { commentId, likerId: userId } };
+
+    const existing = await prisma.commentLike.findUnique({ where: key });
+    if (existing) {
+      await prisma.commentLike.delete({ where: key });
+    } else {
+      await prisma.commentLike.create({ data: { commentId, likerId: userId, type } });
+    }
+    const likesCount = await prisma.commentLike.count({ where: { commentId } });
+
+    return json(req, { liked: !existing, likesCount });
+  } catch (error) {
+    return serverError(req, "POST /api/comment/[id]/likes", error);
   }
-
-  const existing = await prisma.commentLike.findUnique({
-    where: {
-      commentId_likerId: {
-        commentId,
-        likerId: userId,
-      },
-    },
-  });
-
-  if (existing) {
-    await prisma.commentLike.delete({
-      where: {
-        commentId_likerId: {
-          commentId,
-          likerId: userId,
-        },
-      },
-    });
-
-    return NextResponse.json(
-      { liked: false },
-      {
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
-      },
-    );
-  }
-
-  await prisma.commentLike.create({
-    data: {
-      commentId,
-      likerId: userId,
-      type,
-    },
-  });
-
-  return NextResponse.json(
-    { liked: true },
-    {
-      headers: {
-        "Access-Control-Allow-Origin": getCorsOrigin(req),
-      },
-    },
-  );
 }
 
 export async function OPTIONS(req: NextRequest) {
-  return new Response("OK", {
-    status: 200,
-    headers: {
-      "Access-Control-Allow-Origin": getCorsOrigin(req),
-      "Access-Control-Allow-Methods": "POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
-      "Access-Control-Allow-Credentials": "true",
-    },
-  });
+  return options(req, "POST");
 }

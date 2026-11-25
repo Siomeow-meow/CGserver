@@ -1,128 +1,77 @@
-import { NextRequest, NextResponse } from "next/server";
-import { auth } from "@clerk/nextjs/server";
+import { NextRequest } from "next/server";
 import { prisma } from "@/lib/db";
-import { getCorsOrigin } from "@/lib/db";
-import { Message } from "@prisma/client";
-import { createMessage } from "@/lib/conversation";
+import { currentUserId, fail, json, options, readJson, serverError, toId } from "@/lib/http";
+import { createMessage, isParticipant, messageInclude } from "@/lib/conversation";
 
-export async function POST(req: NextRequest) {
-  const { userId } = await auth();
+type Ctx = { params: Promise<{ id: string }> };
 
-  if (!userId) {
-    return NextResponse.json(
-      { error: "Unauthorized" },
-      {
-        status: 401,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
-      },
-    );
+/** Sends a message as the signed-in user. */
+export async function POST(req: NextRequest, { params }: Ctx) {
+  try {
+    const userId = await currentUserId();
+    if (!userId) return fail(req, "Unauthorized", 401);
+
+    const conversationId = toId((await params).id);
+    if (!conversationId || !(await isParticipant(userId, conversationId))) {
+      return fail(req, "Conversation not found", 404);
+    }
+
+    const body = await readJson(req);
+    const content = typeof body?.content === "string" ? body.content.trim() : "";
+    if (!content) return fail(req, "Message cannot be empty", 400);
+
+    let parentId: number | null = null;
+    if (body?.parentId != null) {
+      parentId = toId(String(body.parentId));
+      const parent = parentId
+        ? await prisma.message.findUnique({ where: { id: parentId } })
+        : null;
+      if (!parent || parent.conversationId !== conversationId) {
+        return fail(req, "Reply target not found in this chat", 400);
+      }
+    }
+
+    const message = await createMessage(content, userId, conversationId, parentId);
+    return json(req, message, 201);
+  } catch (error) {
+    return serverError(req, "POST /api/conversation/[id]/message", error);
   }
-
-  const body = await req.json();
-
-  console.log("Body received:", body);
-  const { content, conversationId, senderId } = body;
-
-  if (!content || !conversationId || !senderId) {
-    console.log("Missing fields!");
-    return NextResponse.json(
-      { error: "Missing required fields!" },
-      {
-        status: 400,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
-      },
-    );
-  }
-
-  const message = await createMessage(content, senderId, conversationId);
-
-  return NextResponse.json(message, {
-    headers: {
-      "Access-Control-Allow-Origin": getCorsOrigin(req),
-    },
-  });
 }
 
-export async function GET(req: NextRequest) {
-  const { userId } = await auth();
+/** Messages in the conversation, oldest first, with replies nested. */
+export async function GET(req: NextRequest, { params }: Ctx) {
+  try {
+    const userId = await currentUserId();
+    if (!userId) return fail(req, "Unauthorized", 401);
 
-  if (!userId) {
-    return NextResponse.json(
-      { error: "Unauthorized" },
-      {
-        status: 401,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
-      },
-    );
+    const conversationId = toId((await params).id);
+    if (!conversationId || !(await isParticipant(userId, conversationId))) {
+      return fail(req, "Conversation not found", 404);
+    }
+
+    const messages = await prisma.message.findMany({
+      where: { conversationId },
+      include: messageInclude,
+      orderBy: { createdAt: "asc" },
+    });
+
+    type Node = (typeof messages)[number] & { replies: Node[] };
+    const map = new Map<number, Node>();
+    messages.forEach((m) => map.set(m.id, { ...m, replies: [] }));
+    const roots: Node[] = [];
+    messages.forEach((m) => {
+      const node = map.get(m.id)!;
+      const parent = m.parentId ? map.get(m.parentId) : undefined;
+      if (parent) parent.replies.push(node);
+      else roots.push(node);
+    });
+
+    return json(req, roots);
+  } catch (error) {
+    return serverError(req, "GET /api/conversation/[id]/message", error);
   }
-
-  const { searchParams } = new URL(req.url);
-  const conversationId = searchParams.get("conversationId");
-
-  const messages = await prisma.message.findMany({
-    where: {
-      conversationId: conversationId ? Number(conversationId) : undefined,
-    },
-    include: {
-      sender: {
-        select: { userName: true, profileImg: true },
-      },
-    },
-  });
-
-  const tree = buildTree(messages);
-  console.log("GET /api/messages response:", tree);
-
-  return NextResponse.json(tree, {
-    headers: {
-      "Access-Control-Allow-Origin": getCorsOrigin(req),
-    },
-  });
 }
-
-export async function PATCH(req: NextRequest) {}
-
-export async function DELETE(req: NextRequest) {}
 
 export async function OPTIONS(req: NextRequest) {
-  return new Response("OK", {
-    status: 200,
-    headers: {
-      "Access-Control-Allow-Origin": getCorsOrigin(req),
-      "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
-      "Access-Control-Allow-Credentials": "true",
-    },
-  });
-}
-
-function buildTree(messages: Message[]) {
-  const map = new Map();
-
-  messages.forEach((c) => {
-    map.set(c.id, {
-      ...c,
-      replies: [],
-    });
-  });
-
-  const roots: Comment[] = [];
-
-  messages.forEach((c) => {
-    const node = map.get(c.id);
-
-    if (c.parentId) {
-      map.get(c.parentId)?.replies.push(node);
-    } else {
-      roots.push(node);
-    }
-  });
-
-  return roots;
+  return options(req, "GET, POST");
 }

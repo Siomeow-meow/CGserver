@@ -1,61 +1,60 @@
-/* Postgres
-import { PrismaClient } from "@/app/generated/prisma/client";
-import { PrismaPg } from "@prisma/adapter-pg";
-
-const adapter = new PrismaPg({
-  connectionString: process.env.DATABASE_URL!,
-});
-
-export const prisma = new PrismaClient({
-  adapter,
-});
-*/
-
-import { NextRequest, NextResponse } from "next/server";
-import { auth } from "@clerk/nextjs/server";
+import { NextRequest } from "next/server";
 import { prisma } from "@/lib/db";
-import { getCorsOrigin } from "@/lib/db";
-import { Post } from "@prisma/client";
+import {
+  currentUserId,
+  fail,
+  json,
+  options,
+  readJson,
+  serverError,
+  toId,
+} from "@/lib/http";
+import {
+  cleanStringArray,
+  postInclude,
+  POST_STATUSES,
+  shapePost,
+  visibleTo,
+} from "@/lib/posts";
+import { excerpt, mentionedUserIds, notify } from "@/lib/notify";
 
 export async function POST(req: NextRequest) {
   try {
-    const { userId } = await auth();
+    const userId = await currentUserId();
+    if (!userId) return fail(req, "Unauthorized", 401);
 
-    console.log("POST /api/posts called, userId:", userId);
-    if (!userId) {
-      return NextResponse.json(
-        { error: "Unauthorized" },
-        {
-          status: 401,
-          headers: {
-            "Access-Control-Allow-Origin": getCorsOrigin(req),
-          },
-        },
-      );
+    const body = await readJson(req);
+    if (!body) return fail(req, "Invalid JSON body", 400);
+
+    const title = typeof body.title === "string" ? body.title.trim() : "";
+    const content = typeof body.content === "string" ? body.content : "";
+    const images = cleanStringArray(body.images, 10);
+    const tags = cleanStringArray(body.tags);
+    const status =
+      typeof body.status === "string" && POST_STATUSES.includes(body.status)
+        ? body.status
+        : "published";
+    const groupId = body.groupId == null ? null : toId(String(body.groupId));
+
+    if (!title || (!content.trim() && images.length === 0)) {
+      return fail(req, "A title and either content or an image are required", 400);
     }
+    if (body.groupId != null && !groupId) return fail(req, "Invalid groupId", 400);
 
-    const body = await req.json();
-    console.log("Body received:", body);
+    const author = await prisma.user.findUnique({ where: { id: userId } });
+    if (!author) return fail(req, "Your profile has not been set up yet", 400);
 
-    const { title, content, tags, images, authorId, status, groupId } = body;
-
-    if (!title || !authorId || (!content && images.length === 0)) {
-      console.log(
-        `Missing fields! ${title ? "" : "title "}${content ? "" : "content "}${authorId ? "" : "authorId "}`,
-      );
-      return NextResponse.json(
-        { error: "Missing required fields!" },
-        { status: 400 },
-      );
-    }
-    let author = await prisma.user.findUnique({ where: { id: authorId } });
-
-    if (!author) {
-      console.log("Author not found!");
-      return NextResponse.json(
-        { error: "Author does not Exist!" },
-        { status: 400 },
-      );
+    let isAnonymous = false;
+    if (groupId) {
+      const group = await prisma.group.findUnique({
+        where: { id: groupId },
+        include: { groupMembers: { where: { memberId: userId } } },
+      });
+      if (!group) return fail(req, "Group not found", 404);
+      if (group.groupMembers.length === 0) {
+        return fail(req, "Join the group before posting in it", 403);
+      }
+      isAnonymous = group.allowAnonymity && body.isAnonymous === true;
     }
 
     const post = await prisma.post.create({
@@ -64,119 +63,83 @@ export async function POST(req: NextRequest) {
         content,
         tags,
         images,
-        authorId,
         status,
+        isAnonymous,
         groupId,
+        authorId: userId,
       },
+      include: postInclude(userId),
     });
 
-    return NextResponse.json(post, {
-      headers: {
-        "Access-Control-Allow-Origin": getCorsOrigin(req),
-      },
-    });
+    if (post.status === "published") {
+      const link = `/post/${post.id}`;
+      // Anonymous posts never reveal who wrote them, even in notifications.
+      const actorId = isAnonymous ? null : userId;
+      const notified = new Set<string>([userId]);
+      const items: Parameters<typeof notify>[0] = [];
+      if (!isAnonymous) {
+        for (const id of await mentionedUserIds(`${title} ${content}`)) {
+          notified.add(id);
+          items.push({ userId: id, actorId, type: "mention", content: excerpt(title), link });
+        }
+      }
+      if (groupId) {
+        const members = await prisma.groupMember.findMany({
+          where: { groupId },
+          select: { memberId: true },
+        });
+        for (const m of members) {
+          if (notified.has(m.memberId)) continue;
+          items.push({
+            userId: m.memberId,
+            actorId,
+            type: "group_post",
+            content: excerpt(title),
+            link,
+          });
+        }
+      }
+      await notify(items);
+    }
+
+    return json(req, shapePost(post, userId), 201);
   } catch (error) {
-    console.error("POST /api/posts error:", error);
-    return NextResponse.json(
-      { error: (error as Error).message },
-      {
-        status: 500,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
-      },
-    );
+    return serverError(req, "POST /api/post", error);
   }
 }
 
 export async function GET(req: NextRequest) {
   try {
-    const { userId } = await auth();
-    console.log("GET /api/posts called, userId:", userId);
-    if (!userId) {
-      return NextResponse.json(
-        { error: "Unauthorized" },
-        {
-          status: 401,
-          headers: {
-            "Access-Control-Allow-Origin": getCorsOrigin(req),
-          },
-        },
-      );
-    }
+    const userId = await currentUserId();
+    if (!userId) return fail(req, "Unauthorized", 401);
 
     const { searchParams } = new URL(req.url);
     const authorId = searchParams.get("authorId");
-    const groupId = searchParams.get("groupId");
+    const groupId = toId(searchParams.get("groupId"));
 
     const posts = await prisma.post.findMany({
       where: {
-        authorId: authorId ? authorId : undefined,
-        groupId: groupId ? Number(groupId) : undefined,
+        AND: [
+          visibleTo(userId),
+          authorId
+            ? // Someone else's profile never lists their anonymous posts.
+              authorId === userId
+              ? { authorId }
+              : { authorId, isAnonymous: false }
+            : {},
+          groupId ? { groupId } : {},
+        ],
       },
-      include: {
-        author: {
-          select: {
-            userName: true,
-            profileImg: true,
-          },
-        },
-        likedPost: {
-          where: {
-            likerId: userId,
-          },
-          select: {
-            likerId: true,
-          },
-        },
-        group: {
-          select: {
-            groupName: true,
-            groupImg: true,
-            bannerImg: true,
-          },
-        },
-        _count: {
-          select: {
-            likedPost: true,
-          },
-        },
-      },
+      include: postInclude(userId),
+      orderBy: { createdAt: "desc" },
     });
-    const result = posts.map((post) => ({
-      ...post,
-      likesCount: post._count.likedPost,
-      isLiked: post.likedPost.length > 0,
-    }));
 
-    return NextResponse.json(result, {
-      headers: {
-        "Access-Control-Allow-Origin": getCorsOrigin(req),
-      },
-    });
-  } catch (err) {
-    console.error("GET ERROR:", err);
-
-    return NextResponse.json(
-      { error: String(err) },
-      {
-        status: 500,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
-      },
-    );
+    return json(req, posts.map((p) => shapePost(p, userId)));
+  } catch (error) {
+    return serverError(req, "GET /api/post", error);
   }
 }
 
 export async function OPTIONS(req: NextRequest) {
-  return new Response("OK", {
-    status: 200,
-    headers: {
-      "Access-Control-Allow-Origin": getCorsOrigin(req),
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
-      "Access-Control-Allow-Credentials": "true",
-    },
-  });
+  return options(req, "GET, POST");
 }

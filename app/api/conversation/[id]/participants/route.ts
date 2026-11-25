@@ -1,106 +1,65 @@
-import { NextRequest, NextResponse } from "next/server";
-import { auth } from "@clerk/nextjs/server";
+import { NextRequest } from "next/server";
 import { prisma } from "@/lib/db";
-import { getCorsOrigin } from "@/lib/db";
+import { currentUserId, fail, json, options, readJson, serverError, toId } from "@/lib/http";
+import { isParticipant, participantInclude } from "@/lib/conversation";
 
-export async function POST(
-  req: NextRequest,
-  { params }: { params: Promise<{ id: string }> },
-) {
-  const { userId } = await auth();
-  const { id } = await params;
-  const conversationIdParam = Number(id);
+type Ctx = { params: Promise<{ id: string }> };
 
-  if (!userId) {
-    return NextResponse.json(
-      { error: "Unauthorized" },
-      {
-        status: 401,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
-      },
-    );
-  }
+/** Adds someone to a group chat. Only existing members may add people. */
+export async function POST(req: NextRequest, { params }: Ctx) {
+  try {
+    const userId = await currentUserId();
+    if (!userId) return fail(req, "Unauthorized", 401);
 
-  const body = await req.json();
+    const conversationId = toId((await params).id);
+    if (!conversationId) return fail(req, "Invalid conversation id", 400);
 
-  console.log("Body received:", body);
-  const { participantId, conversationId } = body;
+    const conversation = await prisma.conversation.findUnique({ where: { id: conversationId } });
+    if (!conversation || !(await isParticipant(userId, conversationId))) {
+      return fail(req, "Conversation not found", 404);
+    }
+    if (!conversation.isGroup) return fail(req, "You can only add people to group chats", 400);
 
-  if (conversationIdParam && !conversationId) {
+    const body = await readJson(req);
+    const participantId =
+      typeof body?.participantId === "string" ? body.participantId : "";
+    if (!participantId) return fail(req, "Missing participantId", 400);
+
+    const user = await prisma.user.findUnique({ where: { id: participantId } });
+    if (!user) return fail(req, "User not found", 404);
+    if (await isParticipant(participantId, conversationId)) {
+      return fail(req, "Already in this chat", 409);
+    }
+
     await prisma.conversationParticipant.create({
-      data: {
-        participantId,
-        conversationId: Number(conversationIdParam),
-      },
+      data: { conversationId, participantId },
     });
-  } else {
-    await prisma.conversationParticipant.create({
-      data: {
-        participantId,
-        conversationId,
-      },
-    });
+    return json(req, { added: true }, 201);
+  } catch (error) {
+    return serverError(req, "POST /api/conversation/[id]/participants", error);
   }
-
-  return NextResponse.json(
-    { followed: true },
-    {
-      headers: {
-        "Access-Control-Allow-Origin": getCorsOrigin(req),
-      },
-    },
-  );
 }
 
-export async function GET(req: NextRequest) {
-  const { userId } = await auth();
+export async function GET(req: NextRequest, { params }: Ctx) {
+  try {
+    const userId = await currentUserId();
+    if (!userId) return fail(req, "Unauthorized", 401);
 
-  if (!userId) {
-    return NextResponse.json(
-      { error: "Unauthorized" },
-      {
-        status: 401,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
-      },
-    );
+    const conversationId = toId((await params).id);
+    if (!conversationId || !(await isParticipant(userId, conversationId))) {
+      return fail(req, "Conversation not found", 404);
+    }
+
+    const participants = await prisma.conversationParticipant.findMany({
+      where: { conversationId },
+      include: participantInclude,
+    });
+    return json(req, participants);
+  } catch (error) {
+    return serverError(req, "GET /api/conversation/[id]/participants", error);
   }
-
-  const { searchParams } = new URL(req.url);
-  const conversationId = searchParams.get("conversationId");
-
-  const participants = await prisma.conversationParticipant.findMany({
-    where: {
-      conversationId: conversationId ? Number(conversationId) : undefined,
-    },
-    include: {
-      participant: {
-        select: {
-          userName: true,
-          profileImg: true,
-        },
-      },
-    },
-  });
-
-  return NextResponse.json(participants, {
-    headers: {
-      "Access-Control-Allow-Origin": getCorsOrigin(req),
-    },
-  });
 }
 
 export async function OPTIONS(req: NextRequest) {
-  return new Response("OK", {
-    status: 200,
-    headers: {
-      "Access-Control-Allow-Origin": getCorsOrigin(req),
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
-      "Access-Control-Allow-Credentials": "true",
-    },
-  });
+  return options(req, "GET, POST");
 }

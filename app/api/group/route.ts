@@ -1,177 +1,70 @@
-import { NextRequest, NextResponse } from "next/server";
-import { auth } from "@clerk/nextjs/server";
+import { NextRequest } from "next/server";
 import { prisma } from "@/lib/db";
-import { getCorsOrigin } from "@/lib/db";
-import { Group } from "@prisma/client";
+import { currentUserId, fail, json, options, readJson, serverError } from "@/lib/http";
+import { cleanStringArray } from "@/lib/posts";
+import { groupInclude, shapeGroup } from "@/lib/groups";
 
 export async function POST(req: NextRequest) {
   try {
-    const { userId } = await auth();
-    if (!userId) {
-      return NextResponse.json(
-        { error: "Unauthorized" },
-        {
-          status: 401,
-          headers: {
-            "Access-Control-Allow-Origin": getCorsOrigin(req),
-          },
-        },
-      );
-    }
+    const userId = await currentUserId();
+    if (!userId) return fail(req, "Unauthorized", 401);
 
-    const user = await prisma.user.findUnique({
-      where: { id: userId },
-    });
+    const body = await readJson(req);
+    if (!body) return fail(req, "Invalid JSON body", 400);
 
-    console.log(`${userId}: ${user}`);
-
-    const body = await req.json();
-    console.log("Body received:", body);
-    const { groupName, description, groupImg, bannerImg } = body;
+    const groupName = typeof body.groupName === "string" ? body.groupName.trim() : "";
+    const description = typeof body.description === "string" ? body.description : "";
+    const groupImg = typeof body.groupImg === "string" ? body.groupImg : "";
+    const bannerImg = typeof body.bannerImg === "string" ? body.bannerImg : "";
 
     if (!groupName || !groupImg || !bannerImg) {
-      console.log("Missing fields!");
-      return NextResponse.json(
-        { error: "Missing required fields!" },
-        {
-          status: 400,
-          headers: {
-            "Access-Control-Allow-Origin": getCorsOrigin(req),
-          },
-        },
-      );
-    }
-    let group = await prisma.group.findUnique({ where: { groupName } });
-
-    if (group) {
-      console.log("Group already exist!");
-      return NextResponse.json(
-        { error: "Group already exist!" },
-        {
-          status: 400,
-          headers: {
-            "Access-Control-Allow-Origin": getCorsOrigin(req),
-          },
-        },
-      );
+      return fail(req, "Group name, icon and banner are required", 400);
     }
 
-    group = await prisma.group.create({
+    const user = await prisma.user.findUnique({ where: { id: userId } });
+    if (!user) return fail(req, "Your profile has not been set up yet", 400);
+
+    const taken = await prisma.group.findUnique({ where: { groupName } });
+    if (taken) return fail(req, "A group with that name already exists", 409);
+
+    const group = await prisma.group.create({
       data: {
         groupName,
         description,
         groupImg,
         bannerImg,
-        groupMembers: {
-          create: {
-            memberId: userId,
-            role: "admin",
-          },
-        },
+        groupThemes: cleanStringArray(body.groupThemes),
+        allowAnonymity: body.allowAnonymity === true,
+        groupMembers: { create: { memberId: userId, role: "admin" } },
       },
+      include: groupInclude(userId),
     });
 
-    return NextResponse.json(group, {
-      headers: {
-        "Access-Control-Allow-Origin": getCorsOrigin(req),
-      },
-    });
+    return json(req, shapeGroup(group), 201);
   } catch (error) {
-    console.error("GROUP /api/group error:", error);
-    return NextResponse.json(
-      { error: (error as Error).message },
-      {
-        status: 500,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
-      },
-    );
+    return serverError(req, "POST /api/group", error);
   }
 }
 
+/** All groups, or with ?memberId= only the groups that user belongs to. */
 export async function GET(req: NextRequest) {
-  const { userId } = await auth();
-  if (!userId) {
-    return NextResponse.json(
-      { error: "Unauthorized" },
-      {
-        status: 401,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
-      },
-    );
-  }
+  try {
+    const userId = await currentUserId();
+    if (!userId) return fail(req, "Unauthorized", 401);
 
-  const { searchParams } = new URL(req.url);
-  const memberId = searchParams.get("memberId");
-
-  let groups;
-  if (memberId) {
-    groups = await prisma.group.findMany({
-      where: { groupMembers: { some: { memberId: memberId ?? undefined } } },
-      include: {
-        groupMembers: {
-          where: {
-            memberId: userId,
-          },
-          select: {
-            memberId: true,
-            role: true,
-          },
-        },
-        _count: {
-          select: {
-            groupMembers: true,
-          },
-        },
-      },
+    const memberId = new URL(req.url).searchParams.get("memberId");
+    const groups = await prisma.group.findMany({
+      where: memberId ? { groupMembers: { some: { memberId } } } : undefined,
+      include: groupInclude(userId),
+      orderBy: { groupName: "asc" },
     });
-  } else {
-    groups = await prisma.group.findMany({
-      include: {
-        groupMembers: {
-          where: {
-            memberId: userId,
-          },
-          select: {
-            memberId: true,
-            role: true,
-          },
-        },
-        _count: {
-          select: {
-            groupMembers: true,
-          },
-        },
-      },
-    });
+
+    return json(req, groups.map(shapeGroup));
+  } catch (error) {
+    return serverError(req, "GET /api/group", error);
   }
-
-  // Reshape response
-  const result = groups.map((group) => ({
-    ...group,
-    populationCount: group._count.groupMembers,
-    isFollowed: group.groupMembers.length > 0,
-    isAdmin: group?.groupMembers[0]?.role === "admin",
-  }));
-
-  return NextResponse.json(result, {
-    headers: {
-      "Access-Control-Allow-Origin": getCorsOrigin(req),
-    },
-  });
 }
 
 export async function OPTIONS(req: NextRequest) {
-  return new Response("OK", {
-    status: 200,
-    headers: {
-      "Access-Control-Allow-Origin": getCorsOrigin(req),
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
-      "Access-Control-Allow-Credentials": "true",
-    },
-  });
+  return options(req, "GET, POST");
 }

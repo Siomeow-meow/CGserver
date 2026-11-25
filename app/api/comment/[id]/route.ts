@@ -1,195 +1,93 @@
-import { NextResponse, NextRequest } from "next/server";
-import { auth } from "@clerk/nextjs/server";
+import { NextRequest } from "next/server";
 import { prisma } from "@/lib/db";
-import { getCorsOrigin } from "@/lib/db";
+import {
+  currentUserId,
+  fail,
+  json,
+  options,
+  readJson,
+  serverError,
+  toId,
+} from "@/lib/http";
+import { commentInclude, shapeComment } from "@/lib/comments";
 
-export async function GET(
-  req: NextRequest,
-  { params }: { params: Promise<{ id: string }> },
-) {
-  const { userId } = await auth();
+type Ctx = { params: Promise<{ id: string }> };
 
-  if (!userId) {
-    return NextResponse.json(
-      { error: "Unauthorized" },
-      {
-        status: 401,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
-      },
-    );
+export async function GET(req: NextRequest, { params }: Ctx) {
+  try {
+    const userId = await currentUserId();
+    if (!userId) return fail(req, "Unauthorized", 401);
+
+    const id = toId((await params).id);
+    if (!id) return fail(req, "Invalid comment id", 400);
+
+    const comment = await prisma.comment.findUnique({
+      where: { id },
+      include: commentInclude(userId),
+    });
+    if (!comment) return fail(req, "Comment not found", 404);
+
+    return json(req, shapeComment(comment));
+  } catch (error) {
+    return serverError(req, "GET /api/comment/[id]", error);
   }
-
-  const { id } = await params;
-  const numId = Number(id);
-
-  const [comment, likesCount, likeRecord] = await Promise.all([
-    prisma.comment.findUnique({
-      where: { id: numId },
-      include: { commenter: true },
-    }),
-
-    prisma.commentLike.count({
-      where: { commentId: numId },
-    }),
-
-    prisma.commentLike.findUnique({
-      where: {
-        commentId_likerId: {
-          commentId: numId,
-          likerId: userId,
-        },
-      },
-    }),
-  ]);
-
-  if (!comment) {
-    return NextResponse.json(
-      { error: "Comment not found" },
-      {
-        status: 404,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
-      },
-    );
-  }
-
-  return NextResponse.json(
-    { ...comment, likesCount, isLiked: !!likeRecord },
-    {
-      headers: {
-        "Access-Control-Allow-Origin": getCorsOrigin(req),
-      },
-    },
-  );
 }
 
-export async function PATCH(
-  req: NextRequest,
-  { params }: { params: Promise<{ id: string }> },
-) {
+export async function PATCH(req: NextRequest, { params }: Ctx) {
   try {
-    const { userId } = await auth();
+    const userId = await currentUserId();
+    if (!userId) return fail(req, "Unauthorized", 401);
 
-    if (!userId) {
-      return NextResponse.json(
-        { error: "Unauthorized" },
-        {
-          status: 401,
-          headers: {
-            "Access-Control-Allow-Origin": getCorsOrigin(req),
-          },
-        },
-      );
+    const id = toId((await params).id);
+    if (!id) return fail(req, "Invalid comment id", 400);
+
+    const body = await readJson(req);
+    const content = typeof body?.content === "string" ? body.content.trim() : "";
+    if (!content) return fail(req, "Comment text is required", 400);
+
+    const existing = await prisma.comment.findUnique({ where: { id } });
+    if (!existing) return fail(req, "Comment not found", 404);
+    if (existing.commenterId !== userId) {
+      return fail(req, "You can only edit your own comments", 403);
     }
-
-    const body = await req.json();
-    console.log("Body received:", body);
-    let { content } = body;
-
-    if (!content) {
-      console.error("No change to add");
-      return NextResponse.json(
-        { error: "No change to add" },
-        {
-          status: 400,
-          headers: {
-            "Access-Control-Allow-Origin": getCorsOrigin(req),
-          },
-        },
-      );
-    }
-
-    const { id } = await params;
-    const numId = Number(id);
 
     const comment = await prisma.comment.update({
-      where: { id: numId },
+      where: { id },
       data: { content },
+      include: commentInclude(userId),
     });
-
-    if (!comment) {
-      return NextResponse.json(
-        { error: "User not found" },
-        {
-          status: 404,
-          headers: {
-            "Access-Control-Allow-Origin": getCorsOrigin(req),
-          },
-        },
-      );
-    }
-
-    return NextResponse.json(comment);
+    return json(req, shapeComment(comment));
   } catch (error) {
-    console.error("COMMENT /api/comment/[id] error:", error);
-    return NextResponse.json(
-      { error: (error as Error).message },
-      { status: 500 },
-    );
+    return serverError(req, "PATCH /api/comment/[id]", error);
   }
 }
 
-export async function DELETE(
-  req: NextRequest,
-  { params }: { params: Promise<{ id: string }> },
-) {
+export async function DELETE(req: NextRequest, { params }: Ctx) {
   try {
-    const { userId } = await auth();
+    const userId = await currentUserId();
+    if (!userId) return fail(req, "Unauthorized", 401);
 
-    if (!userId) {
-      return NextResponse.json(
-        { error: "Unauthorized" },
-        {
-          status: 401,
-          headers: {
-            "Access-Control-Allow-Origin": getCorsOrigin(req),
-          },
-        },
-      );
-    }
+    const id = toId((await params).id);
+    if (!id) return fail(req, "Invalid comment id", 400);
 
-    const { id } = await params;
-
-    const post = await prisma.user.delete({
+    const comment = await prisma.comment.findUnique({
       where: { id },
+      include: { post: { select: { authorId: true } } },
     });
+    if (!comment) return fail(req, "Comment not found", 404);
 
-    if (!post) {
-      return NextResponse.json(
-        { error: "Post not found" },
-        {
-          status: 404,
-          headers: {
-            "Access-Control-Allow-Origin": getCorsOrigin(req),
-          },
-        },
-      );
+    // The commenter or the author of the post may remove a comment.
+    if (comment.commenterId !== userId && comment.post.authorId !== userId) {
+      return fail(req, "You can only delete your own comments", 403);
     }
+
+    await prisma.comment.delete({ where: { id } });
+    return json(req, { id, deleted: true });
   } catch (error) {
-    console.error("POST /api/post/[id] error:", error);
-    return NextResponse.json(
-      { error: (error as Error).message },
-      {
-        status: 500,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
-      },
-    );
+    return serverError(req, "DELETE /api/comment/[id]", error);
   }
 }
 
 export async function OPTIONS(req: NextRequest) {
-  return new Response("OK", {
-    status: 200,
-    headers: {
-      "Access-Control-Allow-Origin": getCorsOrigin(req),
-      "Access-Control-Allow-Methods": "GET, POST, DELETE, PATCH, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
-      "Access-Control-Allow-Credentials": "true",
-    },
-  });
+  return options(req, "GET, PATCH, DELETE");
 }

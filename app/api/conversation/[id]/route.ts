@@ -1,134 +1,67 @@
-import { NextResponse, NextRequest } from "next/server";
-import { auth } from "@clerk/nextjs/server";
+import { NextRequest } from "next/server";
 import { prisma } from "@/lib/db";
-import { getCorsOrigin } from "@/lib/db";
+import { currentUserId, fail, json, options, serverError, toId } from "@/lib/http";
+import { isParticipant, participantInclude } from "@/lib/conversation";
 
-export async function GET(
-  req: NextRequest,
-  { params }: { params: Promise<{ id: string }> },
-) {
-  const { userId } = await auth();
+type Ctx = { params: Promise<{ id: string }> };
 
-  if (!userId) {
-    return NextResponse.json(
-      { error: "Unauthorized" },
-      {
-        status: 401,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
+export async function GET(req: NextRequest, { params }: Ctx) {
+  try {
+    const userId = await currentUserId();
+    if (!userId) return fail(req, "Unauthorized", 401);
+
+    const id = toId((await params).id);
+    if (!id) return fail(req, "Invalid conversation id", 400);
+
+    if (!(await isParticipant(userId, id))) {
+      return fail(req, "Conversation not found", 404);
+    }
+    const conversation = await prisma.conversation.findUnique({
+      where: { id },
+      include: {
+        participants: { include: participantInclude },
+        messages: { orderBy: { createdAt: "asc" } },
       },
-    );
+    });
+    return json(req, conversation);
+  } catch (error) {
+    return serverError(req, "GET /api/conversation/[id]", error);
   }
-
-  const { id } = await params;
-  const numId = Number(id);
-
-  const conversation = await prisma.conversation.findUnique({
-    where: { id: numId },
-    include: {
-      participants: {
-        where: {
-          participantId: userId,
-        },
-        select: {
-          participantId: true,
-        },
-      },
-      messages: true,
-    },
-  });
-
-  if (!conversation) {
-    return NextResponse.json(
-      { error: "No existing conversation not found" },
-      {
-        status: 404,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
-      },
-    );
-  }
-
-  const result = conversation;
-
-  return NextResponse.json(result, {
-    headers: {
-      "Access-Control-Allow-Origin": getCorsOrigin(req),
-    },
-  });
 }
 
-export async function DELETE(
-  req: NextRequest,
-  { params }: { params: Promise<{ id: string }> },
-) {
+/**
+ * Direct chat: deletes it for both people. Group chat: you leave it, and it
+ * is deleted once nobody is left.
+ */
+export async function DELETE(req: NextRequest, { params }: Ctx) {
   try {
-    const { userId } = await auth();
+    const userId = await currentUserId();
+    if (!userId) return fail(req, "Unauthorized", 401);
 
-    if (!userId) {
-      return NextResponse.json(
-        { error: "Unauthorized" },
-        {
-          status: 401,
-          headers: {
-            "Access-Control-Allow-Origin": getCorsOrigin(req),
-          },
-        },
-      );
+    const id = toId((await params).id);
+    if (!id) return fail(req, "Invalid conversation id", 400);
+
+    const conversation = await prisma.conversation.findUnique({ where: { id } });
+    if (!conversation || !(await isParticipant(userId, id))) {
+      return fail(req, "Conversation not found", 404);
     }
 
-    const { id } = await params;
-    const numId = Number(id);
-
-    const conversation = await prisma.conversation.delete({
-      where: { id: numId },
-      include: {
-        participants: true,
-        messages: true,
-      },
-    });
-
-    if (!conversation) {
-      return NextResponse.json(
-        { error: "Group not found" },
-        {
-          status: 404,
-          headers: {
-            "Access-Control-Allow-Origin": getCorsOrigin(req),
-          },
-        },
-      );
+    if (conversation.isGroup) {
+      await prisma.conversationParticipant.delete({
+        where: { conversationId_participantId: { conversationId: id, participantId: userId } },
+      });
+      const left = await prisma.conversationParticipant.count({ where: { conversationId: id } });
+      if (left === 0) await prisma.conversation.delete({ where: { id } });
+      return json(req, { id, left: true });
     }
 
-    return NextResponse.json(conversation, {
-      headers: {
-        "Access-Control-Allow-Origin": getCorsOrigin(req),
-      },
-    });
+    await prisma.conversation.delete({ where: { id } });
+    return json(req, { id, deleted: true });
   } catch (error) {
-    console.error("GROUP /api/group/[id] error:", error);
-    return NextResponse.json(
-      { error: (error as Error).message },
-      {
-        status: 500,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
-      },
-    );
+    return serverError(req, "DELETE /api/conversation/[id]", error);
   }
 }
 
 export async function OPTIONS(req: NextRequest) {
-  return new Response("OK", {
-    status: 200,
-    headers: {
-      "Access-Control-Allow-Origin": getCorsOrigin(req),
-      "Access-Control-Allow-Methods": "GET, POST, DELETE, PATCH, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
-      "Access-Control-Allow-Credentials": "true",
-    },
-  });
+  return options(req, "GET, DELETE");
 }

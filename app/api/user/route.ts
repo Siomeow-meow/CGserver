@@ -1,92 +1,79 @@
-import { NextRequest, NextResponse } from "next/server";
-import { auth } from "@clerk/nextjs/server";
+import { NextRequest } from "next/server";
+import { clerkClient } from "@clerk/nextjs/server";
 import { prisma } from "@/lib/db";
-import { getCorsOrigin } from "@/lib/db";
+import {
+  currentUserId,
+  fail,
+  json,
+  options,
+  publicUserSelect,
+  readJson,
+  serverError,
+} from "@/lib/http";
+import { uniqueUserName } from "@/lib/users";
 
+/**
+ * Creates the database profile for the signed-in Clerk user, or returns the
+ * existing one. The id and email always come from Clerk, never the body.
+ */
 export async function POST(req: NextRequest) {
   try {
-    const body = await req.json();
-    console.log("Body received:", body);
-    let { id, userName, email, fName, lName, profileImg, bannerImg } = body;
+    const userId = await currentUserId();
+    if (!userId) return fail(req, "Unauthorized", 401);
 
-    if (!userName || !email) {
-      console.error("Missing required fields: userName or email");
-      return NextResponse.json(
-        { error: "Missing required fields" },
-        {
-          status: 400,
-          headers: {
-            "Access-Control-Allow-Origin": getCorsOrigin(req),
-          },
-        },
-      );
+    const existing = await prisma.user.findUnique({ where: { id: userId } });
+    if (existing) return json(req, existing);
+
+    const clerkUser = await (await clerkClient()).users.getUser(userId);
+    const email =
+      clerkUser.primaryEmailAddress?.emailAddress ??
+      clerkUser.emailAddresses[0]?.emailAddress;
+    if (!email) return fail(req, "Your account has no email address", 400);
+
+    const byEmail = await prisma.user.findUnique({ where: { email } });
+    if (byEmail) {
+      return fail(req, "That email already belongs to another profile", 409);
     }
 
-    let user = await prisma.user.findFirst({
-      where: { email: email },
-    });
+    const body = (await readJson(req)) ?? {};
+    const requested =
+      (typeof body.userName === "string" && body.userName) ||
+      clerkUser.username ||
+      [clerkUser.firstName, clerkUser.lastName].filter(Boolean).join("_") ||
+      email.split("@")[0];
 
-    if (!user) {
-      console.log("USER CREATED");
-      user = await prisma.user.create({
-        data: { id, userName, email, fName, lName, profileImg, bannerImg },
-      });
-    }
-
-    if (user) {
-      console.log("USER ALREADY EXISTS");
-    }
-
-    return NextResponse.json(user, {
-      headers: {
-        "Access-Control-Allow-Origin": getCorsOrigin(req),
+    const user = await prisma.user.create({
+      data: {
+        id: userId,
+        email,
+        userName: await uniqueUserName(requested),
+        fName: clerkUser.firstName,
+        lName: clerkUser.lastName,
+        profileImg: clerkUser.imageUrl,
       },
     });
+    return json(req, user, 201);
   } catch (error) {
-    console.error("POST /api/user error:", error);
-    return NextResponse.json(
-      { error: (error as Error).message },
-      {
-        status: 500,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
-      },
-    );
+    return serverError(req, "POST /api/user", error);
   }
 }
 
+/** Lists users (public fields only, no email addresses). */
 export async function GET(req: NextRequest) {
-  const { userId } = await auth();
+  try {
+    const userId = await currentUserId();
+    if (!userId) return fail(req, "Unauthorized", 401);
 
-  if (!userId) {
-    return NextResponse.json(
-      { error: "Unauthorized" },
-      {
-        status: 401,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
-      },
-    );
+    const users = await prisma.user.findMany({
+      select: publicUserSelect,
+      orderBy: { userName: "asc" },
+    });
+    return json(req, users);
+  } catch (error) {
+    return serverError(req, "GET /api/user", error);
   }
-
-  const users = await prisma.user.findMany();
-  return NextResponse.json(users, {
-    headers: {
-      "Access-Control-Allow-Origin": getCorsOrigin(req),
-    },
-  });
 }
 
 export async function OPTIONS(req: NextRequest) {
-  return new Response("OK", {
-    status: 200,
-    headers: {
-      "Access-Control-Allow-Origin": getCorsOrigin(req),
-      "Access-Control-Allow-Methods": "GET, POST, DELETE, PATCH, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
-      "Access-Control-Allow-Credentials": "true",
-    },
-  });
+  return options(req, "GET, POST");
 }

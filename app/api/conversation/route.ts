@@ -1,138 +1,89 @@
-import { NextRequest, NextResponse } from "next/server";
-import { auth } from "@clerk/nextjs/server";
+import { NextRequest } from "next/server";
 import { prisma } from "@/lib/db";
-import { getCorsOrigin } from "@/lib/db";
-import { Conversation, ConversationParticipant } from "@prisma/client";
-import { findOrCreateConversation } from "@/lib/conversation";
+import { currentUserId, fail, json, options, readJson, serverError } from "@/lib/http";
+import { findOrCreateDirectConversation, participantInclude } from "@/lib/conversation";
 
+/**
+ * Starts a conversation. `participants` is a list of user ids (the signed-in
+ * user is added automatically). One other person gives a direct chat, which
+ * is reused if it already exists; two or more give a new group chat.
+ */
 export async function POST(req: NextRequest) {
   try {
-    const { userId } = await auth();
-    if (!userId) {
-      return NextResponse.json(
-        { error: "Unauthorized" },
-        {
-          status: 401,
-          headers: {
-            "Access-Control-Allow-Origin": getCorsOrigin(req),
-          },
-        },
-      );
+    const userId = await currentUserId();
+    if (!userId) return fail(req, "Unauthorized", 401);
+
+    const body = await readJson(req);
+    const raw: unknown[] = Array.isArray(body?.participants) ? body.participants : [];
+    // Accept plain ids or { participantId } objects.
+    const others = [
+      ...new Set(
+        raw
+          .map((p) =>
+            typeof p === "string"
+              ? p
+              : (p as { participantId?: unknown })?.participantId,
+          )
+          .filter((p): p is string => typeof p === "string" && p !== userId),
+      ),
+    ];
+    if (others.length === 0) return fail(req, "Add at least one other person", 400);
+
+    const found = await prisma.user.count({ where: { id: { in: others } } });
+    if (found !== others.length) return fail(req, "Some users were not found", 404);
+
+    if (others.length === 1) {
+      return json(req, await findOrCreateDirectConversation(userId, others[0]));
     }
 
-    const user = await prisma.user.findUnique({
-      where: { id: userId },
-    });
-
-    const body = await req.json();
-    console.log("Body received:", body);
-    const { participants, message } = body;
-
-    if (!participants) {
-      console.log("Missing fields!");
-      return NextResponse.json(
-        { error: "Missing required fields!" },
-        {
-          status: 400,
-          headers: {
-            "Access-Control-Allow-Origin": getCorsOrigin(req),
-          },
+    const conversation = await prisma.conversation.create({
+      data: {
+        isGroup: true,
+        participants: {
+          create: [userId, ...others].map((participantId) => ({ participantId })),
         },
-      );
-    }
-
-    const receiverId = participants.find(
-      (participant: ConversationParticipant) =>
-        participant.participantId !== userId,
-    );
-
-    const conversation = await findOrCreateConversation([userId, receiverId]);
-
-    return NextResponse.json(conversation, {
-      headers: {
-        "Access-Control-Allow-Origin": getCorsOrigin(req),
       },
+      include: { participants: { include: participantInclude } },
     });
+    return json(req, conversation, 201);
   } catch (error) {
-    console.error("CONVO /api/conversation error:", error);
-    return NextResponse.json(
-      { error: (error as Error).message },
-      {
-        status: 500,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
-      },
-    );
+    return serverError(req, "POST /api/conversation", error);
   }
 }
 
+/** Conversations the signed-in user is part of, with the latest message. */
 export async function GET(req: NextRequest) {
-  const { userId } = await auth();
-  if (!userId) {
-    return NextResponse.json(
-      { error: "Unauthorized" },
-      {
-        status: 401,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
+  try {
+    const userId = await currentUserId();
+    if (!userId) return fail(req, "Unauthorized", 401);
+
+    const conversations = await prisma.conversation.findMany({
+      where: { participants: { some: { participantId: userId } } },
+      include: {
+        participants: { include: participantInclude },
+        messages: { orderBy: { createdAt: "desc" }, take: 1 },
       },
+    });
+
+    const withUnread = await Promise.all(
+      conversations.map(async (c) => {
+        const me = c.participants.find((p) => p.participantId === userId);
+        const unreadCount = await prisma.message.count({
+          where: {
+            conversationId: c.id,
+            senderId: { not: userId },
+            ...(me?.lastReadAt ? { createdAt: { gt: me.lastReadAt } } : {}),
+          },
+        });
+        return { ...c, unreadCount };
+      }),
     );
+    return json(req, withUnread);
+  } catch (error) {
+    return serverError(req, "GET /api/conversation", error);
   }
-
-  const { searchParams } = new URL(req.url);
-  const participantId = searchParams.get("participantId");
-
-  let conversations;
-  if (participantId) {
-    conversations = await prisma.conversation.findMany({
-      where: { participants: { some: { participantId: userId ?? undefined } } },
-      include: {
-        participants: {
-          include: {
-            participant: {
-              select: { userName: true, profileImg: true },
-            },
-          },
-        },
-      },
-    });
-  } else {
-    conversations = await prisma.conversation.findMany({
-      include: {
-        participants: {
-          include: {
-            participant: true,
-          },
-        },
-        messages: {
-          orderBy: {
-            createdAt: "desc",
-          },
-          take: 1,
-        },
-      },
-    });
-  }
-
-  const result = conversations;
-
-  return NextResponse.json(result, {
-    headers: {
-      "Access-Control-Allow-Origin": getCorsOrigin(req),
-    },
-  });
 }
 
 export async function OPTIONS(req: NextRequest) {
-  return new Response("OK", {
-    status: 200,
-    headers: {
-      "Access-Control-Allow-Origin": getCorsOrigin(req),
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
-      "Access-Control-Allow-Credentials": "true",
-    },
-  });
+  return options(req, "GET, POST");
 }

@@ -1,176 +1,81 @@
-import { NextRequest, NextResponse } from "next/server";
+import { NextRequest } from "next/server";
 import { prisma } from "@/lib/db";
-import { auth } from "@clerk/nextjs/server";
-import { getCorsOrigin } from "@/lib/db";
+import { currentUserId, fail, json, options, readJson, serverError } from "@/lib/http";
+import { friendUserSelect } from "@/lib/friends";
+import { notify } from "@/lib/notify";
 
+/** Sends a friend request from the signed-in user. */
 export async function POST(req: NextRequest) {
   try {
-    const { userId } = await auth();
+    const userId = await currentUserId();
+    if (!userId) return fail(req, "Unauthorized", 401);
 
-    if (!userId) {
-      return NextResponse.json(
-        { error: "Unauthorized" },
-        {
-          status: 401,
-          headers: {
-            "Access-Control-Allow-Origin": getCorsOrigin(req),
-          },
-        },
-      );
-    }
+    const body = await readJson(req);
+    const receiverId = typeof body?.receiverId === "string" ? body.receiverId : "";
+    if (!receiverId) return fail(req, "Missing receiverId", 400);
+    if (receiverId === userId) return fail(req, "You cannot add yourself", 400);
 
-    const body = await req.json();
+    const receiver = await prisma.user.findUnique({ where: { id: receiverId } });
+    if (!receiver) return fail(req, "User not found", 404);
 
-    const { receiverId } = body;
-
-    if (!receiverId) {
-      return NextResponse.json(
-        { error: "Missing receiverId" },
-        {
-          status: 400,
-          headers: {
-            "Access-Control-Allow-Origin": getCorsOrigin(req),
-          },
-        },
-      );
-    }
-
-    const senderId = userId;
-
-    const existingFriend = await prisma.friend.findFirst({
+    const existing = await prisma.friend.findFirst({
       where: {
         OR: [
-          {
-            receiverId,
-            userId: senderId,
-          },
-          {
-            receiverId: senderId,
-            userId: receiverId,
-          },
+          { userId, receiverId },
+          { userId: receiverId, receiverId: userId },
         ],
       },
     });
-
-    if (existingFriend) {
-      return NextResponse.json(
-        { error: "Friend request already exists" },
-        {
-          status: 409,
-          headers: {
-            "Access-Control-Allow-Origin": getCorsOrigin(req),
-          },
-        },
-      );
+    if (existing && existing.status !== "DECLINED") {
+      return fail(req, "Friend request already exists", 409);
     }
+    if (existing) await prisma.friend.delete({ where: { id: existing.id } });
 
     const friend = await prisma.friend.create({
-      data: {
-        receiverId,
-        userId: senderId,
-        status: "PENDING",
-      },
+      data: { userId, receiverId, status: "PENDING" },
     });
-
-    return NextResponse.json(friend, {
-      headers: {
-        "Access-Control-Allow-Origin": getCorsOrigin(req),
-      },
+    await notify({
+      userId: receiverId,
+      actorId: userId,
+      type: "friend_request",
+      content: "sent you a friend request",
+      link: `/user/${userId}`,
     });
+    return json(req, friend, 201);
   } catch (error) {
-    console.error("POST /api/friend error:", error);
-    return NextResponse.json(
-      { error: (error as Error).message },
-      {
-        status: 500,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
-      },
-    );
+    return serverError(req, "POST /api/friend", error);
   }
 }
 
+/** Lists the signed-in user's accepted friends. */
 export async function GET(req: NextRequest) {
   try {
-    const { userId } = await auth();
-
-    if (!userId) {
-      return NextResponse.json(
-        { error: "Unauthorized" },
-        {
-          status: 401,
-          headers: {
-            "Access-Control-Allow-Origin": getCorsOrigin(req),
-          },
-        },
-      );
-    }
+    const userId = await currentUserId();
+    if (!userId) return fail(req, "Unauthorized", 401);
 
     const friends = await prisma.friend.findMany({
-      where: {
-        status: "ACCEPTED",
-        OR: [{ userId }, { receiverId: userId }],
-      },
-
+      where: { status: "ACCEPTED", OR: [{ userId }, { receiverId: userId }] },
       include: {
-        receiver: {
-          select: {
-            id: true,
-            userName: true,
-            profileImg: true,
-          },
-        },
-
-        user: {
-          select: {
-            id: true,
-            userName: true,
-            profileImg: true,
-          },
-        },
+        receiver: { select: friendUserSelect },
+        user: { select: friendUserSelect },
       },
+      orderBy: { createdAt: "desc" },
     });
 
-    const result = friends.map((friend) => {
-      const otherUser =
-        friend.userId === userId ? friend.receiver : friend.user;
-
-      return {
-        id: friend.id,
-        status: friend.status,
-        createdAt: friend.createdAt,
-        otherUser,
-      };
-    });
-
-    return NextResponse.json(result, {
-      headers: {
-        "Access-Control-Allow-Origin": getCorsOrigin(req),
-      },
-    });
-  } catch (error) {
-    console.error("FRIEND /api/friend/request error:", error);
-    return NextResponse.json(
-      { error: (error as Error).message },
-      {
-        status: 500,
-        headers: {
-          "Access-Control-Allow-Origin": getCorsOrigin(req),
-        },
-      },
+    return json(
+      req,
+      friends.map((f) => ({
+        id: f.id,
+        status: f.status,
+        createdAt: f.createdAt,
+        otherUser: f.userId === userId ? f.receiver : f.user,
+      })),
     );
+  } catch (error) {
+    return serverError(req, "GET /api/friend", error);
   }
 }
 
 export async function OPTIONS(req: NextRequest) {
-  return new Response("OK", {
-    status: 200,
-    headers: {
-      "Access-Control-Allow-Origin": getCorsOrigin(req),
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
-      "Access-Control-Allow-Credentials": "true",
-    },
-  });
+  return options(req, "GET, POST");
 }

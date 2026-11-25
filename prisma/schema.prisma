@@ -19,6 +19,9 @@ model User {
   lName             String?
   profileImg        String?
   bannerImg         String?
+  savedPosts        SavedPost[]
+  notifications     Notification[]             @relation("NotificationsReceived")
+  notificationsSent Notification[]             @relation("NotificationsSent")
   posts             Post[]
   comments          Comment[]
   likedPost         PostLike[]
@@ -37,11 +40,13 @@ model Post {
   images         String[]
   createdAt      DateTime  @default(now())
   status         String    @default("draft")
+  isAnonymous    Boolean   @default(false)
   authorId       String
   author         User      @relation(fields: [authorId], references: [id], onDelete: Cascade) 
   viewers        Viewers[]
   comments       Comment[]
   likedPost      PostLike[]
+  savedBy        SavedPost[]
   groupId        Int?
   group          Group?      @relation(fields: [groupId], references: [id], onDelete: Cascade)
 }
@@ -62,10 +67,11 @@ model Comment {
 model Group{ 
   id               Int      @id @default(autoincrement())
   groupName        String   @unique
-  description      String
+  description      String   @default("")
   groupImg         String
   bannerImg        String
   groupThemes      String[]
+  allowAnonymity   Boolean  @default(false)
   posts            Post[]
   groupMembers     GroupMember[]
 }
@@ -79,11 +85,19 @@ model GroupMember{
 
   @@id([memberId, groupId])
 }
-model Notifications {
+model Notification {
   id         Int      @id @default(autoincrement())
+  userId     String
+  user       User     @relation("NotificationsReceived", fields: [userId], references: [id], onDelete: Cascade)
+  actorId    String?
+  actor      User?    @relation("NotificationsSent", fields: [actorId], references: [id], onDelete: Cascade)
+  type       String
   content    String
   link       String
-  createdAt  DateTime  @default(now())
+  read       Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  @@index([userId, createdAt])
 }
 model Friend {
   id          Int       @id @default(autoincrement())
@@ -99,7 +113,7 @@ model Viewers {
   id         Int       @id @default(autoincrement())
   postId     Int
   viewerId   String
-  post       Post      @relation(fields: [postId], references: [id])
+  post       Post      @relation(fields: [postId], references: [id], onDelete: Cascade)
   @@unique([postId, viewerId])
 }
 model PostLike {
@@ -108,16 +122,16 @@ model PostLike {
   postId     Int
   post       Post      @relation(fields: [postId], references: [id], onDelete: Cascade) 
   likerId    String
-  liker      User     @relation(fields: [likerId], references: [id])
+  liker      User     @relation(fields: [likerId], references: [id], onDelete: Cascade)
   @@unique([postId, likerId])
 }
 model CommentLike {
   id         Int       @id @default(autoincrement())
   type       String
   commentId  Int
-  comment    Comment   @relation(fields: [commentId], references: [id]) 
+  comment    Comment   @relation(fields: [commentId], references: [id], onDelete: Cascade)
   likerId    String
-  liker      User     @relation(fields: [likerId], references: [id])
+  liker      User     @relation(fields: [likerId], references: [id], onDelete: Cascade)
   @@unique([commentId, likerId])
 }
 model Message {
@@ -144,9 +158,20 @@ model Conversation {
 model ConversationParticipant {
   conversationId  Int
   participantId   String
+  lastReadAt      DateTime?
 
   conversation    Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
-  participant     User         @relation(fields: [participantId], references: [id])
+  participant     User         @relation(fields: [participantId], references: [id], onDelete: Cascade)
 
   @@id([conversationId, participantId])
+}
+
+model SavedPost {
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  postId    Int
+  post      Post     @relation(fields: [postId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@id([userId, postId])
 }
